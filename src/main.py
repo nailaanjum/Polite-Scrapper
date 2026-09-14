@@ -1,9 +1,11 @@
-import requests, os, time
+import requests, os, time, re, json
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+from pydantic import BaseModel, HttpUrl, ValidationError
 
 CACHE_DIR = "cache"
+OUTPUT_DIR = "output"
 USER_AGENT = "FlyRankInternshipA9/1.0 (+github.com/nailaanjum/Polite-Scrapper)"
 START_URL = "https://books.toscrape.com/catalogue/page-1.html"
 
@@ -22,7 +24,7 @@ def fetch_page(url, cache_filename):
     if response.status_code != 200:
         raise Exception(f"Fetch failed {url}: {response.status_code}")
 
-    response.encoding = "utf-8"   # <-- add this line, before reading .text
+    response.encoding = "utf-8"
     html = response.text
     with open(cache_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -33,38 +35,28 @@ def fetch_page(url, cache_filename):
 
 def extract_book_links(html, page_url):
     soup = BeautifulSoup(html, "html.parser")
-    links = []
-    for a_tag in soup.select("article.product_pod h3 a"):
-        href = a_tag["href"]
-        absolute_url = urljoin(page_url, href)
-        links.append(absolute_url)
-    return links
+    return [urljoin(page_url, a["href"]) for a in soup.select("article.product_pod h3 a")]
 
 
 def find_next_page(html, page_url):
     soup = BeautifulSoup(html, "html.parser")
     next_tag = soup.select_one("li.next a")
-    if next_tag:
-        return urljoin(page_url, next_tag["href"])
-    return None
+    return urljoin(page_url, next_tag["href"]) if next_tag else None
 
 
 def discover_book_urls(max_pages=3):
     all_links = []
-    page_url_map = {}   # book_url -> which catalogue page it came from
+    page_url_map = {}
     current_url = START_URL
     page_count = 0
 
     while current_url and page_count < max_pages:
         page_count += 1
-        cache_filename = f"catalogue-page-{page_count}.html"
-        html = fetch_page(current_url, cache_filename)
-
-        links_on_this_page = extract_book_links(html, current_url)
-        all_links += links_on_this_page
-        for link in links_on_this_page:
+        html = fetch_page(current_url, f"catalogue-page-{page_count}.html")
+        links_on_page = extract_book_links(html, current_url)
+        all_links += links_on_page
+        for link in links_on_page:
             page_url_map[link] = current_url
-
         current_url = find_next_page(html, current_url)
 
     unique_links = list(dict.fromkeys(all_links))
@@ -84,10 +76,7 @@ def extract_book_record(html, product_url, source_page):
     rating_text = rating_tag["class"][1] if rating_tag else None
 
     desc_heading = soup.select_one("#product_description")
-    if desc_heading:
-        description = desc_heading.find_next_sibling("p").text.strip()
-    else:
-        description = None
+    description = desc_heading.find_next_sibling("p").text.strip() if desc_heading else None
 
     return {
         "title": title,
@@ -104,22 +93,66 @@ def extract_book_record(html, product_url, source_page):
 def extract_all_books(book_urls, page_url_map):
     records = []
     for i, url in enumerate(book_urls, start=1):
-        cache_filename = f"book-{i}.html"
-        html = fetch_page(url, cache_filename)
+        html = fetch_page(url, f"book-{i}.html")
         source_page = page_url_map.get(url, "unknown")
-        record = extract_book_record(html, url, source_page)
-        records.append(record)
+        records.append(extract_book_record(html, url, source_page))
 
     print(f"detail_pages={len(records)}")
     return records
 
 
+# ---------- Stage 4: schema, normalize, validate, persist ----------
+
+class Book(BaseModel):
+    title: str
+    product_url: HttpUrl
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: str | None
+    description: str | None
+    source_page: str
+    fetched_at: str
+
+
+def parse_price(price_text):
+    match = re.search(r"[\d.]+", price_text)
+    if not match:
+        raise ValueError(f"could not parse price from '{price_text}'")
+    return float(match.group())
+
+
+def normalize_and_validate(raw_records):
+    valid_by_url = {}
+    errors = []
+
+    for raw in raw_records:
+        try:
+            price_gbp = parse_price(raw["price_text"])
+            candidate = {**raw, "price_gbp": price_gbp}
+            book = Book(**candidate)
+            valid_by_url[str(book.product_url)] = json.loads(book.model_dump_json())
+        except (ValidationError, ValueError, KeyError) as e:
+            errors.append({"record": raw, "reason": str(e)})
+
+    return list(valid_by_url.values()), errors
+
+
+def save_output(valid_records, errors):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(os.path.join(OUTPUT_DIR, "books.json"), "w", encoding="utf-8") as f:
+        json.dump(valid_records, f, indent=2)
+    with open(os.path.join(OUTPUT_DIR, "errors.json"), "w", encoding="utf-8") as f:
+        json.dump(errors, f, indent=2)
+
+
 def main():
     book_urls, page_url_map = discover_book_urls()
-    records = extract_all_books(book_urls, page_url_map)
+    raw_records = extract_all_books(book_urls, page_url_map)
+    valid_records, errors = normalize_and_validate(raw_records)
+    save_output(valid_records, errors)
 
-    # Print one complete record to prove all 8 keys are present
-    print(records[0])
+    print(f"valid_records={len(valid_records)} errors={len(errors)}")
 
 
 if __name__ == "__main__":
