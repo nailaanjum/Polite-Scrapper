@@ -201,8 +201,8 @@ def main():
     book_urls, page_url_map, cat_fetched, cat_cached = discover_book_urls()
 
     # --- Stage 5 proof: inject one fake URL on purpose ---
-    book_urls.append(FAKE_URL)
-    page_url_map[FAKE_URL] = "manual-test"
+    #book_urls.append(FAKE_URL) step 6 , these will be changed into comment 
+    #page_url_map[FAKE_URL] = "manual-test" step 6 , these will be changed into comment 
     # -------------------------------------------------------
 
     raw_records, failed_pages, det_fetched, det_cached = extract_all_books(book_urls, page_url_map)
